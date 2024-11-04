@@ -1,709 +1,790 @@
 """
-Module core pour l'analyse sémantique des mots-clés.
+Module core optimisé pour l'analyse sémantique des mots-clés.
+Optimisé pour les performances et la gestion mémoire.
 """
-import numpy as np
 from typing import List, Dict, Optional, Set
+import numpy as np
 import pandas as pd
 from pathlib import Path
 import joblib
-import logging
 from datetime import datetime
 from dataclasses import dataclass
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
 import sys
 from sklearn.feature_extraction.text import TfidfVectorizer
-from numpy.linalg import norm
-from numpy import dot
+import scipy.sparse as sp
+from utils import Timer, safe_filename
+import hashlib
 
-# Import des utilitaires
-from utils import calculate_similarity, CacheManager, Timer, safe_filename
-
-@dataclass
+@dataclass(frozen=True)
 class KeywordData:
-    """Structure de données pour les informations de mots-clés"""
+    """Structure de données immutable pour les informations de mots-clés"""
     keyword: str
     volume: int
-    difficulty: float = 0.0
     vector: Optional[np.ndarray] = None
-    cluster_id: int = -1
     semantic_score: float = 0.0
 
-class LightweightSemanticCore:
-    """Version optimisée pour ordinateurs portables"""
+class SmartCache:
+    """Gestionnaire de cache intelligent avec limite de taille et LRU"""
+    
+    def __init__(self, max_size: int = 10000):
+        self._cache: Dict = {}
+        self._access_count: Dict = {}
+        self._max_size = max_size
+        self._lock = threading.Lock()
+        
+    def get(self, key: str) -> Optional[any]:
+        with self._lock:
+            if key in self._cache:
+                self._access_count[key] += 1
+                return self._cache[key]
+            return None
+            
+    def set(self, key: str, value: any):
+        with self._lock:
+            if len(self._cache) >= self._max_size:
+                # Supprime 20% des entrées les moins utilisées
+                items_to_remove = int(self._max_size * 0.2)
+                sorted_items = sorted(
+                    self._access_count.items(),
+                    key=lambda x: x[1]
+                )[:items_to_remove]
+                
+                for k, _ in sorted_items:
+                    del self._cache[k]
+                    del self._access_count[k]
+                    
+            self._cache[key] = value
+            self._access_count[key] = 1
+            
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            self._access_count.clear()
+            
+    @property
+    def size(self) -> int:
+        return len(self._cache)
+
+class OptimizedSemanticCore:
+    """Core sémantique optimisé avec gestion efficace de la mémoire"""
     
     def __init__(self, cache_dir: str = './cache'):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        self._vectors_cache_file = self.cache_dir / 'vectors_cache.npz'
+        self._keywords_cache_file = self.cache_dir / 'keywords_cache.pkl'
+        self._model_file = self.cache_dir / 'tfidf_model.pkl'
         
-        # Configuration du logging
-        self.logger = logging.getLogger(__name__)
+        # Initialisation des caches optimisés
+        self.vector_cache = SmartCache(10000)
+        self.similarity_cache = SmartCache(20000)
         
-        # Initialisation des caches
-        self.cache_manager = CacheManager(cache_dir)
-        self.vector_cache = {}
-        self.similarity_cache = {}
-        self._cache_lock = threading.Lock()
+        # Initialisation unique du vectorizer
+        self.tfidf = None
+        self._load_or_init_model()
         
-        # Données des mots-clés
+        # Données des mots-clés avec stockage optimisé
         self.keyword_data: Dict[str, KeywordData] = {}
         
-        # Initialisation des modèles légers
-        self._initialize_models()
+        # Pool de threads pour les calculs parallèles
+        self._executor = ThreadPoolExecutor(max_workers=4)
         
-    def _initialize_models(self):
-        """Initialise les modèles légers"""
-        self.tfidf = TfidfVectorizer(
-            ngram_range=(1, 3),
-            min_df=2,
-            max_features=10000  # Limite pour la mémoire
-        )
+    def _load_or_init_model(self):
+        """Charge ou initialise le modèle TF-IDF une seule fois"""
+        if self._model_file.exists():
+            self.tfidf = joblib.load(self._model_file)
+        else:
+            self.tfidf = TfidfVectorizer(
+                ngram_range=(1, 2),
+                min_df=2,
+                max_features=5000,
+                norm='l2'
+            )
         
-        # Chargement du cache des vecteurs s'il existe
-        cache_file = self.cache_dir / 'vectors.joblib'
-        if cache_file.exists():
-            try:
-                self.vector_cache = joblib.load(cache_file)
-                self.logger.info(f"Cache vectoriel chargé: {len(self.vector_cache)} entrées")
-            except Exception as e:
-                self.logger.error(f"Erreur chargement cache: {e}")
-                self.vector_cache = {}
-            
-    def _compute_ngram_vector(self, text: str) -> np.ndarray:
-        """Calcule un vecteur basé sur les n-grammes"""
-        # Création d'une matrice TF-IDF pour un seul texte
+    def _vectorize_text(self, text: str) -> sp.csr_matrix:
+        """Vectorisation optimisée avec gestion des formats sparse"""
         try:
             vector = self.tfidf.transform([text])
-            return vector.toarray()[0]
+            if vector.nnz < vector.shape[1] * 0.1:  # Si moins de 10% non-nul
+                return vector
+            return vector.toarray()
         except Exception:
-            # Si le mot n'est pas dans le vocabulaire
-            return np.zeros(self.tfidf.max_features)
+            return sp.csr_matrix((1, self.tfidf.get_feature_names_out().shape[0]))
             
-    def _preprocess_keywords(self, keywords: List[str]):
-        """Pré-traitement efficace des mots-clés"""
-        self.logger.info("Démarrage du pré-traitement des mots-clés...")
+    def load_keywords(self, data: pd.DataFrame) -> None:
+        """Chargement optimisé avec cache persistant"""
+        # Création d'une clé de hash pour les données
+        data_hash = hashlib.md5(
+            pd.util.hash_pandas_object(data).values
+        ).hexdigest()
         
-        # Mise à jour du vocabulaire TF-IDF
-        self.tfidf.fit(keywords)
-        
-        # Pré-calcul des vecteurs en batch
-        with Timer("Calcul des vecteurs"):
-            vectors = self.tfidf.transform(keywords)
-        
-        # Mise en cache des vecteurs
-        with Timer("Mise en cache"):
-            for idx, keyword in enumerate(keywords):
-                self.vector_cache[keyword] = vectors[idx].toarray()[0]
-            
-        # Sauvegarde du cache
-        with Timer("Sauvegarde du cache"):
-            joblib.dump(self.vector_cache, self.cache_dir / 'vectors.joblib')
-            
-        self.logger.info(f"Pré-traitement terminé pour {len(keywords)} mots-clés")
+        # Vérification du cache
+        cache_hash_file = self.cache_dir / 'data_hash.txt'
+        if cache_hash_file.exists():
+            with open(cache_hash_file, 'r') as f:
+                cached_hash = f.read().strip()
+                
+            if cached_hash == data_hash:
+                # Chargement depuis le cache
+                self._load_from_cache()
+                return
 
-    def load_keywords(self, 
-                     data: pd.DataFrame, 
-                     keyword_col: str = 'keyword',
-                     volume_col: str = 'volume',
-                     difficulty_col: Optional[str] = None) -> None:
-        """
-        Charge les données de mots-clés depuis un DataFrame
-        """
-        if not all(col in data.columns for col in [keyword_col, volume_col]):
-            raise ValueError(f"Colonnes requises manquantes: {keyword_col}, {volume_col}")
-        
-        # Nettoyage des données
-        data[keyword_col] = data[keyword_col].str.lower().str.strip()
-        data = data.drop_duplicates(subset=[keyword_col])
-        
-        # Chargement des données
-        with Timer("Chargement des mots-clés"):
-            for _, row in tqdm(data.iterrows(), total=len(data), desc="Chargement"):
-                keyword = row[keyword_col]
-                volume = int(row[volume_col])
-                difficulty = float(row.get(difficulty_col, 0.0)) if difficulty_col else 0.0
+        # Si pas de cache valide, effectuer le traitement
+        with Timer("Vectorisation"):
+            if not hasattr(self.tfidf, 'vocabulary_') or not self.tfidf.vocabulary_:
+                self.tfidf.fit(data['keyword'])
+                joblib.dump(self.tfidf, self._model_file)
                 
-                self.keyword_data[keyword] = KeywordData(
-                    keyword=keyword,
-                    volume=volume,
-                    difficulty=difficulty
-                )
+            vectors = self.tfidf.transform(data['keyword'])
+            
+        with Timer("Chargement"):
+            # Traitement par lots pour réduire l'utilisation mémoire
+            batch_size = 1000
+            self.keyword_data = {}
+            
+            for i in range(0, len(data), batch_size):
+                batch = data.iloc[i:i+batch_size]
+                batch_vectors = vectors[i:i+batch_size]
+                
+                for idx, row in batch.iterrows():
+                    self.keyword_data[row['keyword']] = KeywordData(
+                        keyword=row['keyword'],
+                        volume=int(row['volume']),
+                        vector=batch_vectors[idx-i].toarray()[0] if sp.issparse(batch_vectors[idx-i]) else batch_vectors[idx-i]
+                    )
+                    
+            # Sauvegarde du cache
+            self._save_to_cache(data_hash)
+
+    def _save_to_cache(self, data_hash: str):
+        """Sauvegarde optimisée du cache"""
+        # Sauvegarde des vecteurs en format sparse
+        vectors = sp.vstack([
+            sp.csr_matrix(kd.vector) for kd in self.keyword_data.values()
+        ])
+        sp.save_npz(self._vectors_cache_file, vectors)
         
-        # Pré-traitement des vecteurs
-        self._preprocess_keywords(list(self.keyword_data.keys()))
+        # Sauvegarde des métadonnées
+        metadata = {
+            k: KeywordData(keyword=v.keyword, volume=v.volume, vector=None)
+            for k, v in self.keyword_data.items()
+        }
+        joblib.dump(metadata, self._keywords_cache_file)
         
-        self.logger.info(f"Chargement terminé: {len(self.keyword_data)} mots-clés")
+        # Sauvegarde du hash
+        with open(self.cache_dir / 'data_hash.txt', 'w') as f:
+            f.write(data_hash)
+            
+    def _load_from_cache(self):
+        """Chargement optimisé depuis le cache"""
+        vectors = sp.load_npz(self._vectors_cache_file)
+        metadata = joblib.load(self._keywords_cache_file)
         
+        self.keyword_data = {}
+        for i, (keyword, data) in enumerate(metadata.items()):
+            self.keyword_data[keyword] = KeywordData(
+                keyword=data.keyword,
+                volume=data.volume,
+                vector=vectors[i].toarray()[0]
+            )
+
     def calculate_similarity(self, word1: str, word2: str) -> float:
-        """Calcul de similarité optimisé"""
-        # Vérification du cache de similarité
-        cache_key = f"{word1}|{word2}"
-        with self._cache_lock:
-            if cache_key in self.similarity_cache:
-                return self.similarity_cache[cache_key]
+        """Calcul de similarité optimisé avec cache intelligent"""
+        cache_key = f"{min(word1, word2)}|{max(word1, word2)}"
         
+        # Vérification du cache
+        cached = self.similarity_cache.get(cache_key)
+        if cached is not None:
+            return cached
+            
         try:
-            # Récupération ou calcul des vecteurs
-            vec1 = self.vector_cache.get(word1)
-            if vec1 is None:
-                vec1 = self._compute_ngram_vector(word1)
-                
-            vec2 = self.vector_cache.get(word2)
-            if vec2 is None:
-                vec2 = self._compute_ngram_vector(word2)
+            # Récupération des vecteurs
+            vec1 = self.keyword_data[word1].vector
+            vec2 = self.keyword_data[word2].vector
             
             if vec1 is None or vec2 is None:
                 return 0.0
-            
-            # Calcul de la similarité cosinus
+                
+            # Protection contre les vecteurs nuls
             norm1 = np.linalg.norm(vec1)
             norm2 = np.linalg.norm(vec2)
             
             if norm1 == 0 or norm2 == 0:
-                return 0.0
-                
-            similarity = float(np.dot(vec1, vec2) / (norm1 * norm2))
+                similarity = 0.0
+            else:
+                # Calcul optimisé de la similarité cosinus
+                similarity = float(np.dot(vec1, vec2) / (norm1 * norm2))
             
-            # Mise en cache
-            with self._cache_lock:
-                self.similarity_cache[cache_key] = similarity
-                
+            # Mise en cache du résultat
+            self.similarity_cache.set(cache_key, similarity)
+            
             return max(0.0, min(1.0, similarity))
             
         except Exception as e:
-            self.logger.error(f"Erreur de calcul de similarité: {e}")
+            print(f"Erreur calcul similarité: {e}")  # Remplacé logger par print
             return 0.0
-
-    def find_similar_keywords(self, 
+            
+    def find_similar_keywords(self,
                             keyword: str,
-                            min_similarity: float = 0.5,
+                            min_similarity: float = 0.3,
                             max_results: int = 10,
                             min_volume: int = 0) -> List[Dict]:
-        """Trouve les mots-clés similaires avec filtrage"""
+        """Recherche optimisée de mots-clés similaires"""
         if keyword not in self.keyword_data:
             return []
             
-        results = []
-        
-        # Calcul par lots pour l'efficacité
-        batch_size = 1000
-        all_keywords = list(self.keyword_data.keys())
-        
-        for i in range(0, len(all_keywords), batch_size):
-            batch = all_keywords[i:i+batch_size]
-            
-            for kw in batch:
+        # Calcul parallèle des similarités
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for kw in self.keyword_data:
                 if kw != keyword and self.keyword_data[kw].volume >= min_volume:
-                    similarity = self.calculate_similarity(keyword, kw)
+                    futures.append(
+                        executor.submit(self.calculate_similarity, keyword, kw)
+                    )
+                    
+            # Collecte des résultats
+            results = []
+            for future, kw in zip(futures, [k for k in self.keyword_data if k != keyword]):
+                try:
+                    similarity = future.result()
                     if similarity >= min_similarity:
                         results.append({
                             'keyword': kw,
                             'similarity': round(similarity, 3),
                             'volume': self.keyword_data[kw].volume
                         })
-        
+                except Exception as e:
+                    self.logger.error(f"Erreur calcul similarité pour {kw}: {e}")
+                    
         return sorted(
             results,
-            key=lambda x: (x['similarity'], x['volume']),
-            reverse=True
+            key=lambda x: (-x['similarity'], -x['volume'])
         )[:max_results]
-
-    def suggest_keywords(self,
-                        current_keywords: Set[str],
-                        max_suggestions: int = 10,
-                        min_similarity: float = 0.3,
-                        min_volume: int = 0,
-                        min_distance: float = 0.2) -> List[Dict]:
-        """
-        Suggestions optimisées avec contrôle de distance
-        """
-        # Validation des mots-clés existants
-        valid_current_keywords = {
-            kw for kw in current_keywords 
-            if kw in self.keyword_data
-        }
         
-        if not valid_current_keywords:
-            self.logger.warning("Aucun mot-clé valide dans les mots-clés actuels")
+    def suggest_keywords(self,
+                    current_keywords: Set[str],
+                    max_suggestions: int = 10,
+                    min_similarity: float = 0.3,
+                    min_volume: int = 0) -> List[Dict]:
+        """Suggestions sémantiques avancées pour cocons SEO"""
+        if not current_keywords:
             return []
 
-        suggestions = []
-        seen_keywords = set(valid_current_keywords)
-        
-        # Parcours optimisé du dictionnaire de mots-clés
-        all_keywords = list(self.keyword_data.keys())
-        batch_size = 1000
-        
-        for i in range(0, len(all_keywords), batch_size):
-            batch = all_keywords[i:i+batch_size]
-            
-            for kw in batch:
-                # Vérifications préliminaires
-                if (kw in seen_keywords or 
-                    self.keyword_data[kw].volume < min_volume):
-                    continue
-                
-                try:
-                    # Calcul des similarités avec gestion d'erreurs
-                    similarities = []
-                    for current_kw in valid_current_keywords:
-                        try:
-                            sim = self.calculate_similarity(kw, current_kw)
-                            if sim is not None:
-                                similarities.append(sim)
-                        except Exception as e:
-                            self.logger.error(f"Erreur calcul similarité {kw}/{current_kw}: {e}")
-                            continue
-                    
-                    if not similarities:
-                        continue
-                        
-                    avg_similarity = np.mean(similarities)
-                    
-                    # Vérification de la distance minimale
-                    too_close = False
-                    if min_distance > 0:
-                        for existing in suggestions:
-                            try:
-                                distance = 1 - self.calculate_similarity(
-                                    kw, 
-                                    existing['keyword']
-                                )
-                                if distance < min_distance:
-                                    too_close = True
-                                    break
-                            except Exception as e:
-                                self.logger.error(f"Erreur calcul distance {kw}: {e}")
-                                continue
-                    
-                    if too_close:
-                        continue
-                    
-                    # Ajout de la suggestion si elle correspond aux critères
-                    if avg_similarity >= min_similarity:
-                        suggestion = {
-                            'keyword': kw,
-                            'similarity': round(avg_similarity, 3),
-                            'volume': self.keyword_data[kw].volume,
-                            'relevance': round(
-                                avg_similarity * (1 + np.log1p(
-                                    self.keyword_data[kw].volume / 1000
-                                )), 
-                                3
-                            ),
-                            'matches': len([
-                                s for s in similarities 
-                                if s >= min_similarity
-                            ]),
-                            'intent_match': round(
-                                len(set(kw.split()) & 
-                                    set(' '.join(valid_current_keywords).split())) / 
-                                len(set(kw.split())), 
-                                3
-                            )
-                        }
-                        suggestions.append(suggestion)
-                        
-                        # Optimisation: arrêt si max_suggestions atteint
-                        if len(suggestions) >= max_suggestions * 2:
-                            break
-                            
-                except Exception as e:
-                    self.logger.error(f"Erreur traitement mot-clé {kw}: {e}")
-                    continue
-        
-        # Tri final et limitation du nombre de suggestions
-        try:
-            suggestions.sort(key=lambda x: (-x['relevance'], -x['volume']))
-            return suggestions[:max_suggestions]
-        except Exception as e:
-            self.logger.error(f"Erreur tri final des suggestions: {e}")
-            return suggestions[:max_suggestions]  # Retour non trié en cas d'erreur
-        
-    def cluster_suggestions(self, suggestions: List[Dict], threshold: float = 0.5) -> Dict[int, List[str]]:
-        """
-        Regroupe les suggestions en clusters basés sur leur similarité sémantique.
-        
-        Args:
-            suggestions: Liste des suggestions (dictionnaires avec clé 'keyword')
-            threshold: Seuil de similarité pour le clustering (0.0 à 1.0)
-            
-        Returns:
-            Dict[int, List[str]]: Dictionnaire des clusters {id_cluster: [mots-clés]}
-        """
-        if not suggestions:
-            return {}
-            
-        # Extraction des mots-clés
-        keywords = [s['keyword'] for s in suggestions]
-        
-        # Initialisation des clusters
-        clusters = {}
-        assigned_keywords = set()
-        cluster_id = 0
-        
-        try:
-            # Pour chaque mot-clé non assigné
-            for keyword in keywords:
-                if keyword in assigned_keywords:
-                    continue
-                    
-                # Création d'un nouveau cluster
-                current_cluster = [keyword]
-                assigned_keywords.add(keyword)
-                
-                # Recherche des mots-clés similaires
-                for other_keyword in keywords:
-                    if other_keyword != keyword and other_keyword not in assigned_keywords:
-                        similarity = self.calculate_similarity(keyword, other_keyword)
-                        if similarity >= threshold:
-                            current_cluster.append(other_keyword)
-                            assigned_keywords.add(other_keyword)
-                
-                # Sauvegarde du cluster s'il contient plus d'un mot-clé
-                if len(current_cluster) > 1:
-                    clusters[cluster_id] = current_cluster
-                    cluster_id += 1
-                    
-            # Ajout des mots-clés isolés dans un cluster spécial
-            remaining = [k for k in keywords if k not in assigned_keywords]
-            if remaining:
-                clusters[cluster_id] = remaining
-                
-            return clusters
-            
-        except Exception as e:
-            self.logger.error(f"Erreur lors du clustering des suggestions: {e}")
-            return {0: keywords}  # En cas d'erreur, retourne tous les mots-clés dans un seul cluster
+        valid_keywords = {k for k in current_keywords if k in self.keyword_data}
+        if not valid_keywords:
+            return []
 
+        candidates = {}
+        max_volume = max(data.volume for data in self.keyword_data.values())
+        
+        # Calcul du centroïde sémantique du cocon
+        cocon_vectors = [self.keyword_data[kw].vector for kw in valid_keywords]
+        cocon_centroid = np.mean(cocon_vectors, axis=0)
+        
+        # Calcul de la dispersion sémantique du cocon
+        semantic_dispersion = np.std([
+            self.calculate_vector_similarity(vec, cocon_centroid)
+            for vec in cocon_vectors
+        ])
+
+        for candidate, data in self.keyword_data.items():
+            if candidate in valid_keywords or data.volume < min_volume:
+                continue
+
+            # Calcul des similarités avec structure hiérarchique
+            hierarchical_similarities = {
+                'direct': [],      # Similarités directes avec les mots-clés
+                'secondary': [],   # Similarités avec les mots connexes
+                'centroid': 0.0    # Similarité avec le centroïde du cocon
+            }
+
+            # 1. Similarités directes
+            for current_kw in valid_keywords:
+                sim = self.calculate_similarity(candidate, current_kw)
+                if sim >= min_similarity:
+                    hierarchical_similarities['direct'].append(sim)
+
+            if not hierarchical_similarities['direct']:
+                continue
+
+            # 2. Similarités secondaires (avec les mots connexes du cocon)
+            connected_keywords = set()
+            for kw in valid_keywords:
+                if kw in self.keyword_data:
+                    related = self.get_related_keywords(kw, min_similarity)
+                    connected_keywords.update(related)
+            
+            for related_kw in connected_keywords:
+                if related_kw not in valid_keywords:
+                    sim = self.calculate_similarity(candidate, related_kw)
+                    if sim >= min_similarity:
+                        hierarchical_similarities['secondary'].append(sim)
+
+            # 3. Similarité avec le centroïde
+            hierarchical_similarities['centroid'] = self.calculate_vector_similarity(
+                data.vector, 
+                cocon_centroid
+            )
+
+            # Calculs des scores avancés
+            direct_score = np.mean(hierarchical_similarities['direct'])
+            secondary_score = (np.mean(hierarchical_similarities['secondary']) 
+                             if hierarchical_similarities['secondary'] else 0)
+            centroid_score = hierarchical_similarities['centroid']
+            
+            # Normalisation du volume avec échelle logarithmique
+            volume_score = np.log1p(data.volume) / np.log1p(max_volume)
+            
+            # Score sémantique pondéré
+            semantic_score = (
+                0.50 * direct_score +          # Similarité directe
+                0.25 * secondary_score +       # Similarité secondaire
+                0.25 * centroid_score          # Cohérence avec le cocon
+            )
+
+            # Score de positionnement dans la hiérarchie
+            hierarchy_score = (
+                0.6 * max(hierarchical_similarities['direct']) +  # Meilleure connexion
+                0.4 * (1 - semantic_dispersion)                  # Cohésion du cocon
+            )
+
+            # Pertinence finale multi-facteurs
+            relevance = (
+                0.40 * semantic_score +     # Force sémantique
+                0.25 * hierarchy_score +    # Position hiérarchique
+                0.20 * volume_score +       # Importance SEO
+                0.15 * (1 - (len(hierarchical_similarities['direct']) / len(valid_keywords)))  # Originalité
+            )
+
+            candidates[candidate] = {
+                'keyword': candidate,
+                'similarity': round(semantic_score, 3),
+                'volume': data.volume,
+                'relevance': round(relevance, 3),
+                'hierarchy_score': round(hierarchy_score, 3),
+                'direct_connections': len(hierarchical_similarities['direct']),
+                'secondary_connections': len(hierarchical_similarities['secondary']),
+                'centroid_similarity': round(centroid_score, 3)
+            }
+
+        # Tri intelligent avec diversification
+        suggestions = self._diversify_suggestions(
+            candidates.values(),
+            max_suggestions,
+            semantic_dispersion
+        )
+
+        return suggestions
+
+    def _diversify_suggestions(self, candidates: List[Dict], 
+                             max_count: int, 
+                             dispersion: float) -> List[Dict]:
+        """Diversification intelligente des suggestions"""
+        if not candidates:
+            return []
+
+        selected = []
+        remaining = list(candidates)
+        
+        # Sélection du premier candidat (meilleure pertinence)
+        remaining.sort(key=lambda x: (-x['relevance'], -x['volume']))
+        selected.append(remaining.pop(0))
+        
+        # Sélection itérative avec diversification
+        while len(selected) < max_count and remaining:
+            scores = []
+            for candidate in remaining:
+                # Score de diversité par rapport aux sélectionnés
+                diversity_score = np.mean([
+                    1 - self.calculate_similarity(candidate['keyword'], s['keyword'])
+                    for s in selected
+                ])
+                
+                # Score combiné (pertinence + diversité)
+                combined_score = (
+                    0.7 * candidate['relevance'] +
+                    0.3 * diversity_score
+                )
+                scores.append((candidate, combined_score))
+            
+            # Sélection du meilleur candidat
+            best_candidate = max(scores, key=lambda x: x[1])[0]
+            selected.append(best_candidate)
+            remaining.remove(best_candidate)
+
+        return selected
+        
     def analyze_keyword_group(self,
                             keywords: Set[str],
-                            min_similarity: float = 0.5) -> Dict[str, Dict]:
-        """Analyse un groupe de mots-clés"""
-        cache_key = f"analysis_{'-'.join(sorted(keywords))}"
-        cached = self.cache_manager.get(cache_key)
-        
-        if cached:
-            return cached
+                            min_similarity: float = 0.3) -> Dict[str, Dict]:
+        """Analyse optimisée d'un groupe de mots-clés"""
+        valid_keywords = {k for k in keywords if k in self.keyword_data}
+        if not valid_keywords:
+            return {}
             
         analysis = {}
-        for keyword in keywords:
-            if keyword not in self.keyword_data:
-                continue
-                
-            related = []
-            similarities = []
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                kw: [
+                    executor.submit(self.calculate_similarity, kw, other_kw)
+                    for other_kw in valid_keywords if other_kw != kw
+                ]
+                for kw in valid_keywords
+            }
             
-            for other_kw in keywords:
-                if other_kw != keyword:
-                    similarity = self.calculate_similarity(keyword, other_kw)
-                    if similarity >= min_similarity:
-                        related.append({
+            for kw, kw_futures in futures.items():
+                try:
+                    similarities = [f.result() for f in kw_futures]
+                    related = [
+                        {
                             'keyword': other_kw,
-                            'similarity': round(similarity, 3),
+                            'similarity': sim,
                             'volume': self.keyword_data[other_kw].volume
-                        })
-                        similarities.append(similarity)
-            
-            analysis[keyword] = {
-                'volume': self.keyword_data[keyword].volume,
-                'semantic_strength': round(np.mean(similarities), 3) if similarities else 0,
-                'related_keywords': sorted(
-                    related,
-                    key=lambda x: x['similarity'],
-                    reverse=True
-                ),
-                'cluster_score': len(related)
-            }
-        
-        self.cache_manager.set(cache_key, analysis)
-        return analysis
-
-    def export_cocoon(self, keywords: Set[str]) -> Dict:
-        """Exporte les données du cocon sémantique"""
-        with Timer("Export du cocon"):
-            analysis = self.analyze_keyword_group(keywords)
-            clusters = self._generate_clusters(keywords, analysis)
-            
-            export_data = {
-                'metadata': {
-                    'timestamp': datetime.now().isoformat(),
-                    'total_keywords': len(keywords),
-                    'avg_volume': round(
-                        np.mean([self.keyword_data[kw].volume for kw in keywords]),
-                        2
-                    )
-                },
-                'keywords': [
-                    {
-                        'keyword': kw,
-                        **analysis[kw]
+                        }
+                        for other_kw, sim in zip(
+                            [k for k in valid_keywords if k != kw],
+                            similarities
+                        )
+                        if sim >= min_similarity
+                    ]
+                    
+                    analysis[kw] = {
+                        'volume': self.keyword_data[kw].volume,
+                        'semantic_strength': round(np.mean(similarities), 3),
+                        'related_keywords': sorted(
+                            related,
+                            key=lambda x: -x['similarity']
+                        )
                     }
-                    for kw in keywords
-                ],
-                'clusters': clusters
-            }
-            
-            # Sauvegarde du cocon
-            export_file = self.cache_dir / f'cocon_{safe_filename("_".join(sorted(keywords)))}.json'
-            with open(export_file, 'w', encoding='utf-8') as f:
-                json.dump(export_data, f, ensure_ascii=False, indent=2)
-                
-            return export_data
-
-    def _generate_clusters(self,
-                         keywords: Set[str],
-                         analysis: Dict) -> List[Dict]:
-        """Génère des clusters pour le cocon"""
-        used_keywords = set()
-        clusters = []
+                except Exception as e:
+                    self.logger.error(f"Erreur analyse pour {kw}: {e}")
+                    
+        return analysis
         
-        # Tri par force sémantique
-        sorted_keywords = sorted(
-            keywords,
-            key=lambda k: analysis[k]['semantic_strength'],
-            reverse=True
-        )
+    def export_data(self, keywords: Set[str]) -> Dict:
+        """Export optimisé des données"""
+        analysis = self.analyze_keyword_group(keywords)
         
-        for keyword in sorted_keywords:
-            if keyword in used_keywords:
-                continue
-                
-            cluster = {
-                'center': keyword,
-                'keywords': [keyword],
-                'total_volume': analysis[keyword]['volume'],
-                'avg_similarity': analysis[keyword]['semantic_strength']
-            }
-            
-            used_keywords.add(keyword)
-            
-            # Ajout des mots-clés fortement liés
-            for related in analysis[keyword]['related_keywords']:
-                if related['keyword'] not in used_keywords:
-                    cluster['keywords'].append(related['keyword'])
-                    cluster['total_volume'] += related['volume']
-                    used_keywords.add(related['keyword'])
-            
-            if len(cluster['keywords']) > 1:
-                clusters.append(cluster)
+        export_data = {
+            'metadata': {
+                'timestamp': datetime.now().isoformat(),
+                'total_keywords': len(keywords),
+                'avg_volume': round(
+                    np.mean([
+                        self.keyword_data[kw].volume 
+                        for kw in keywords 
+                        if kw in self.keyword_data
+                    ]),
+                    2
+                )
+            },
+            'keywords': [
+                {
+                    'keyword': kw,
+                    **analysis.get(kw, {
+                        'volume': self.keyword_data[kw].volume,
+                        'semantic_strength': 0.0,
+                        'related_keywords': []
+                    })
+                }
+                for kw in keywords
+                if kw in self.keyword_data
+            ]
+        }
         
-        return clusters
-
-    def clear_caches(self) -> None:
-        """Nettoie tous les caches"""
+        # Sauvegarde
+        export_file = self.cache_dir / f'export_{safe_filename("_".join(sorted(keywords)))}.json'
+        with open(export_file, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2)
+            
+        return export_data
+        
+    def cleanup(self) -> Dict[str, int]:
+        """Nettoyage complet des caches"""
+        stats = {
+            'vector_cache_cleared': self.vector_cache.size,
+            'similarity_cache_cleared': self.similarity_cache.size
+        }
+        
         self.vector_cache.clear()
         self.similarity_cache.clear()
-        self.cache_manager.clear()
-
+        
+        return stats
+        
     def get_stats(self) -> Dict[str, any]:
-        """Retourne les statistiques du core"""
-        return {
-            'total_keywords': len(self.keyword_data),
-            'cached_vectors': len(self.vector_cache),
-            'total_volume': sum(data.volume for data in self.keyword_data.values()),
-            'avg_difficulty': np.mean([
-                data.difficulty 
-                for data in self.keyword_data.values()
-            ]),
-            'memory_usage': {
-                'vector_cache_mb': sum(
-                    sys.getsizeof(vector) 
-                    for vector in self.vector_cache.values()
-                ) / (1024 * 1024),
-                'similarity_cache_mb': sys.getsizeof(self.similarity_cache) / (1024 * 1024),
-                'total_keywords_mb': sum(
-                    sys.getsizeof(data) 
-                    for data in self.keyword_data.values()
+        """Statistiques d'utilisation optimisées"""
+        try:
+            return {
+                'total_keywords': len(self.keyword_data),
+                'vector_cache_size': self.vector_cache.size,
+                'similarity_cache_size': self.similarity_cache.size,
+                'total_volume': sum(
+                    data.volume for data in self.keyword_data.values()
+                ),
+                'memory_usage_mb': sum(
+                    sys.getsizeof(data) for data in self.keyword_data.values()
                 ) / (1024 * 1024)
-            },
-            'cache_info': {
-                'vectors': len(self.vector_cache),
-                'similarities': len(self.similarity_cache)
             }
-        }
-
-    def get_keyword_stats(self, keyword: str) -> Dict:
-        """Récupère les statistiques détaillées d'un mot-clé"""
+        except Exception as e:
+            self.loggerself.logger.error(f"Erreur calcul stats: {e}")
+            return {
+                'total_keywords': 0,
+                'vector_cache_size': 0,
+                'similarity_cache_size': 0,
+                'total_volume': 0,
+                'memory_usage_mb': 0
+            }
+            
+    def get_keyword_info(self, keyword: str) -> Dict:
+        """Récupération optimisée des informations d'un mot-clé"""
         if keyword not in self.keyword_data:
             return {}
             
         data = self.keyword_data[keyword]
-        vector = self.vector_cache.get(keyword)
         
         return {
             'keyword': keyword,
             'volume': data.volume,
-            'difficulty': data.difficulty,
-            'has_vector': vector is not None,
-            'vector_dim': len(vector) if vector is not None else 0,
-            'cached': keyword in self.vector_cache,
             'semantic_score': data.semantic_score,
-            'cluster_id': data.cluster_id,
-            'memory_usage': {
-                'vector_bytes': sys.getsizeof(vector) if vector is not None else 0,
-                'data_bytes': sys.getsizeof(data)
-            }
+            'vector_size': (
+                sys.getsizeof(data.vector) 
+                if data.vector is not None 
+                else 0
+            ) / 1024,  # KB
+            'is_cached': self.vector_cache.get(keyword) is not None
         }
 
-    def cleanup_caches(self, max_cache_size_mb: float = 1000) -> dict:
-        """
-        Nettoie les caches si leur taille dépasse la limite
+    def batch_process_similarities(self,
+                                 keywords: List[str],
+                                 threshold: float = 0.3) -> np.ndarray:
+        """Calcul optimisé des similarités par lot"""
+        n = len(keywords)
+        similarities = np.zeros((n, n))
         
-        Args:
-            max_cache_size_mb (float): Taille maximale du cache en MB
+        # Création de la matrice de vecteurs
+        vectors = np.vstack([
+            self.keyword_data[kw].vector 
+            for kw in keywords
+        ])
+        
+        # Calcul matriciel des similarités
+        norms = np.linalg.norm(vectors, axis=1)
+        similarities = np.dot(vectors, vectors.T) / np.outer(norms, norms)
+        
+        # Application du seuil
+        similarities[similarities < threshold] = 0
+        
+        return similarities
+        
+    def precompute_common_keywords(self, top_n: int = 1000):
+        """Pré-calcul des similarités pour les mots-clés fréquents"""
+        if not self.keyword_data:
+            return
             
-        Returns:
-            dict: Statistiques du nettoyage
-        """
-        stats_before = self.get_stats()
-        cleaned_items = {
-            'vector_cache': 0,
-            'similarity_cache': 0,
-            'memory_freed': 0
-        }
+        common_keywords = sorted(
+            self.keyword_data.items(),
+            key=lambda x: x[1].volume,
+            reverse=True
+        )[:top_n]
         
+        self.logger.info(f"Pré-calcul pour {len(common_keywords)} mots-clés...")
+        
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(
+                    self.calculate_similarity,
+                    kw1[0], kw2[0]
+                )
+                for i, kw1 in enumerate(common_keywords)
+                for kw2 in common_keywords[i+1:]
+            ]
+            
+            # Collecte silencieuse des résultats
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+                    
+        self.logger.info("Pré-calcul terminé")
+
+    @staticmethod
+    def calculate_vector_similarity(vec1: np.ndarray, 
+                                  vec2: np.ndarray) -> float:
+        """Calcul optimisé de similarité entre vecteurs"""
         try:
-            # Calcul de la taille actuelle totale
-            total_cache_mb = (
-                stats_before['memory_usage']['vector_cache_mb'] +
-                stats_before['memory_usage']['similarity_cache_mb']
-            )
+            if sp.issparse(vec1):
+                vec1 = vec1.toarray().flatten()
+            if sp.issparse(vec2):
+                vec2 = vec2.toarray().flatten()
+                
+            norm1 = np.linalg.norm(vec1)
+            norm2 = np.linalg.norm(vec2)
             
-            self.logger.info(f"Taille cache actuelle: {total_cache_mb:.1f}MB")
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+                
+            return float(np.dot(vec1, vec2) / (norm1 * norm2))
             
-            if total_cache_mb > max_cache_size_mb:
-                # 1. Nettoyage du cache de similarité
-                similarity_size = len(self.similarity_cache)
-                self.similarity_cache.clear()
-                cleaned_items['similarity_cache'] = similarity_size
-                
-                # 2. Nettoyage sélectif du cache vectoriel
-                if stats_before['memory_usage']['vector_cache_mb'] > max_cache_size_mb * 0.8:
-                    vector_size = len(self.vector_cache)
-                    
-                    # Garde uniquement les vecteurs des mots-clés les plus utilisés
-                    keep_keywords = set(sorted(
-                        self.keyword_data.keys(),
-                        key=lambda k: self.keyword_data[k].volume,
-                        reverse=True
-                    )[:1000])  # Garde les 1000 mots-clés les plus volumineux
-                    
-                    # Nouveau cache vectoriel
-                    new_vector_cache = {
-                        k: v for k, v in self.vector_cache.items()
-                        if k in keep_keywords
-                    }
-                    
-                    # Mise à jour du cache
-                    self.vector_cache = new_vector_cache
-                    cleaned_items['vector_cache'] = vector_size - len(new_vector_cache)
-                
-                # 3. Nettoyage du cache du gestionnaire
-                self.cache_manager.clear()
-                
-                # 4. Force le garbage collector
-                import gc
-                gc.collect()
-                
-                # Calcul des statistiques après nettoyage
-                stats_after = self.get_stats()
-                cleaned_items['memory_freed'] = round(
-                    total_cache_mb - (
-                        stats_after['memory_usage']['vector_cache_mb'] +
-                        stats_after['memory_usage']['similarity_cache_mb']
-                    ),
-                    2
-                )
-                
-                self.logger.info(
-                    f"Nettoyage terminé: {cleaned_items['memory_freed']}MB libérés"
-                )
-                
-            else:
-                self.logger.info("Nettoyage non nécessaire")
-                
-        except Exception as e:
-            self.logger.error(f"Erreur pendant le nettoyage: {e}")
-            raise
-            
-        return cleaned_items
+        except Exception:
+            return 0.0
 
-# Tests unitaires et exemple d'utilisation
+    def optimize_memory(self, max_memory_mb: float = 1000.0):
+        """Optimisation de l'utilisation mémoire"""
+        current_memory = self.get_stats()['memory_usage_mb']
+        
+        if current_memory > max_memory_mb:
+            self.logger.info(f"Optimisation mémoire: {current_memory:.1f}MB -> {max_memory_mb}MB")
+            
+            # 1. Nettoyage des caches
+            self.cleanup()
+            
+            # 2. Conversion des vecteurs en format sparse si possible
+            for kw, data in self.keyword_data.items():
+                if data.vector is not None:
+                    vec = data.vector
+                    if not sp.issparse(vec):
+                        sparsity = np.count_nonzero(vec) / vec.size
+                        if sparsity < 0.1:  # Si moins de 10% non-nul
+                            self.keyword_data[kw] = KeywordData(
+                                keyword=data.keyword,
+                                volume=data.volume,
+                                vector=sp.csr_matrix(vec),
+                                semantic_score=data.semantic_score
+                            )
+            
+            # 3. Force le garbage collector
+            import gc
+            gc.collect()
+            
+            new_memory = self.get_stats()['memory_usage_mb']
+            self.logger.info(f"Mémoire après optimisation: {new_memory:.1f}MB")
+            
+    def __enter__(self):
+        """Support du context manager"""
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Nettoyage à la sortie du context manager"""
+        self.cleanup()
+        self._executor.shutdown()
+        
+# Tests unitaires et exemples d'utilisation
 if __name__ == "__main__":
-    import pandas as pd
-    
-    def test_semantic_core():
-        """Test des fonctionnalités principales"""
-        print("🧪 Démarrage des tests...")
+    def run_benchmark():
+        """Test de performance"""
+        print("\n🔬 Démarrage du benchmark...")
         
-        # Initialisation
-        with Timer("Initialisation du core"):
-            core = LightweightSemanticCore()
+        # Génération de données de test
+        import numpy as np
+        test_size = 1000
         
-        # Données de test
+        keywords = [f"keyword_{i}" for i in range(test_size)]
+        volumes = np.random.randint(100, 10000, size=test_size)
+        
         test_data = pd.DataFrame({
-            'keyword': ['marketing digital', 'seo', 'référencement naturel', 
-                       'stratégie marketing', 'content marketing'],
-            'volume': [1000, 800, 900, 600, 700]
+            'keyword': keywords,
+            'volume': volumes
         })
         
-        # Test du chargement
-        print("\n📥 Test du chargement des données...")
-        core.load_keywords(test_data)
-        assert len(core.keyword_data) == len(test_data), "Erreur de chargement"
-        print("✅ Chargement OK")
+        with Timer("Test complet"), OptimizedSemanticCore() as core:
+            # Test chargement
+            with Timer("Chargement"):
+                core.load_keywords(test_data)
+                
+            # Test similarités
+            with Timer("Calcul similarités"):
+                for _ in range(100):
+                    kw1, kw2 = np.random.choice(keywords, 2)
+                    core.calculate_similarity(kw1, kw2)
+                    
+            # Test suggestions
+            with Timer("Suggestions"):
+                suggestions = core.suggest_keywords(
+                    set(np.random.choice(keywords, 5)),
+                    max_suggestions=10
+                )
+                
+            # Test analyse
+            with Timer("Analyse"):
+                analysis = core.analyze_keyword_group(
+                    set(np.random.choice(keywords, 10))
+                )
+                
+            # Stats finales
+            stats = core.get_stats()
+            print("\n📊 Statistiques finales:")
+            for key, value in stats.items():
+                if isinstance(value, float):
+                    print(f"- {key}: {value:.2f}")
+                else:
+                    print(f"- {key}: {value}")
+                    
+    def run_basic_tests():
+        """Tests basiques de fonctionnalité"""
+        print("\n🧪 Tests basiques...")
         
-        # Test de similarité
-        print("\n🔍 Test du calcul de similarité...")
-        similarity = core.calculate_similarity('marketing digital', 'seo')
-        print(f"Similarité marketing digital/seo: {similarity:.3f}")
-        assert 0 <= similarity <= 1, "Score de similarité invalide"
-        print("✅ Calcul de similarité OK")
+        test_data = pd.DataFrame({
+            'keyword': ['marketing digital', 'seo', 'référencement'],
+            'volume': [1000, 800, 600]
+        })
         
-        # Test de recherche
-        print("\n🔎 Test de recherche de mots-clés similaires...")
-        similar = core.find_similar_keywords('marketing digital', max_results=3)
-        print("Mots-clés similaires à 'marketing digital':")
-        for kw in similar:
-            print(f"- {kw['keyword']}: {kw['similarity']:.3f}")
-        assert len(similar) <= 3, "Trop de résultats retournés"
-        print("✅ Recherche OK")
+        with OptimizedSemanticCore() as core:
+            # Test chargement
+            core.load_keywords(test_data)
+            assert len(core.keyword_data) == 3
+            
+            # Test similarité
+            sim = core.calculate_similarity('marketing digital', 'seo')
+            assert 0 <= sim <= 1
+            
+            # Test suggestions
+            suggs = core.suggest_keywords({'marketing digital'})
+            assert len(suggs) > 0
+            
+            print("✅ Tests basiques OK")
+            
+    def run_stress_test():
+        """Test de charge"""
+        print("\n💪 Test de charge...")
         
-        # Test d'analyse
-        print("\n📊 Test d'analyse de groupe...")
-        analysis = core.analyze_keyword_group({'marketing digital', 'seo'})
-        assert len(analysis) == 2, "Erreur dans l'analyse de groupe"
-        print("✅ Analyse OK")
+        # Génération de données
+        test_size = 5000
+        keywords = [f"keyword_{i}" for i in range(test_size)]
+        volumes = np.random.randint(100, 10000, size=test_size)
         
-        # Test d'export
-        print("\n📤 Test d'export...")
-        export = core.export_cocoon({'marketing digital', 'seo'})
-        assert 'metadata' in export, "Format d'export invalide"
-        print("✅ Export OK")
+        test_data = pd.DataFrame({
+            'keyword': keywords,
+            'volume': volumes
+        })
         
-        # Test de nettoyage des caches
-        print("\n🧹 Test du nettoyage des caches...")
-        core.cleanup_caches(max_cache_size_mb=100)
-        print("✅ Nettoyage OK")
-        
-        # Statistiques finales
-        print("\n📈 Statistiques du core:")
-        stats = core.get_stats()
-        for key, value in stats.items():
-            if isinstance(value, dict):
-                print(f"\n{key}:")
-                for subkey, subvalue in value.items():
-                    print(f"  - {subkey}: {subvalue}")
-            else:
-                print(f"- {key}: {value}")
-        
-        print("\n✨ Tous les tests sont passés avec succès!")
-
+        with Timer("Test de charge"), OptimizedSemanticCore() as core:
+            core.load_keywords(test_data)
+            
+            # Test calculs intensifs
+            with ThreadPoolExecutor() as executor:
+                futures = []
+                for _ in range(1000):
+                    kw1, kw2 = np.random.choice(keywords, 2)
+                    futures.append(
+                        executor.submit(core.calculate_similarity, kw1, kw2)
+                    )
+                    
+                for future in futures:
+                    future.result()
+                    
+            print("✅ Test de charge OK")
+            
     try:
-        test_semantic_core()
+        print("🚀 Démarrage des tests...")
+        run_basic_tests()
+        run_benchmark()
+        run_stress_test()
+        print("\n✨ Tous les tests sont passés avec succès!")
+        
     except Exception as e:
         print(f"\n❌ Erreur pendant les tests: {str(e)}")
         raise
