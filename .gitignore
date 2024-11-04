@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+
+# Environnement virtuel
+venv/
+env/
+
+# Dossiers spécifiques à l'application
+cache/
+**/cache/
+app/cache/
+app/cache/vectors.joblib
+vectors.joblib
+**/vectors.joblib
+logs/
+data/
+exports/
+
+# Fichiers de données volumineux
+*.joblib
+*.model
+*.vec
+*.bin
+*.csv
+*.xlsx
+
+
+# Fichiers spécifiques volumineux
+**/app/cache/vectors.joblib
+**/cache/vectors.joblib
+vectors.joblib
+
+# IDE
+.vscode/
+.idea/
+
+# Système
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environnement
+.env
+*.env
+
+# Temporaires
+*.tmp
+*.bak
+*~

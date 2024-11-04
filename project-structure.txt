@@ -1,0 +1,11 @@
+semantic_cocoon/
+├── app.py               # Application Streamlit
+├── core.py             # Core sémantique
+├── requirements.txt    # Dépendances
+├── install.sh          # Script d'installation (Linux/Mac)
+├── install.bat         # Script d'installation (Windows)
+├── run.sh             # Script de lancement (Linux/Mac)
+├── run.bat            # Script de lancement (Windows)
+├── cache/             # Dossier pour le cache
+├── data/              # Dossier pour les données
+└── logs/              # Dossier pour les logs
